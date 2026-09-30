@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# aiswitch — pick a saved Claude Code / Codex account (via aisw) and
+# reopen VS Code with that account already loaded.
+#
+#   aiswitch                   numbered menu of your saved accounts
+#   aiswitch codex recraft     switch straight to one account
+#   aiswitch --list            show accounts, change nothing
+#
+# Options:
+#   --no-restart   switch accounts but leave VS Code alone
+#   --reopen       don't switch; just restart VS Code with the current accounts
+#   --yes          restart VS Code without asking first
+#   --open PATH    folder to open in VS Code (default: current folder,
+#                  or just your previous windows when run from ~)
+
+set -o pipefail
+
+bold=$'\033[1m'; dim=$'\033[2m'; green=$'\033[32m'; red=$'\033[31m'; reset=$'\033[0m'
+die() { echo "${red}aiswitch: $*${reset}" >&2; exit 1; }
+
+list_only=0; restart=1; reopen=0; assume_yes=0; open_path=""; direct=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --list|-l)      list_only=1 ;;
+    --no-restart)   restart=0 ;;
+    --reopen)       reopen=1 ;;
+    --yes|-y)       assume_yes=1 ;;
+    --open)         shift; open_path="${1:-}" ;;
+    -h|--help)      sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)             die "unknown option $1 (try --help)" ;;
+    *)              direct+=("$1") ;;
+  esac
+  shift
+done
+
+command -v aisw    >/dev/null || die "aisw not found on PATH"
+command -v python3 >/dev/null || die "python3 not found on PATH"
+
+tool_title() { case "$1" in claude) echo "Claude Code" ;; codex) echo "Codex" ;; esac; }
+
+# ── Read saved profiles: one line each, fields tool/name/label/active ──
+read_profiles() {
+  aisw list --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for tool in ("claude", "codex"):
+    t = d.get(tool) or {}
+    for p in t.get("profiles", []):
+        print("\x1f".join([tool, p["name"], p.get("label") or "",
+                         "1" if p["name"] == t.get("active") else "0"]))
+'
+}
+
+tools=(); names=(); labels=(); actives=()
+while IFS=$'\x1f' read -r t n l a; do
+  [ -n "$t" ] || continue
+  tools+=("$t"); names+=("$n"); labels+=("$l"); actives+=("$a")
+done < <(read_profiles)
+
+[ ${#tools[@]} -gt 0 ] || die "no saved Claude or Codex profiles. Add one with: aisw add claude <name>"
+
+show_menu() {
+  local i last=""
+  for i in "${!tools[@]}"; do
+    if [ "${tools[$i]}" != "$last" ]; then
+      echo; echo "${bold}$(tool_title "${tools[$i]}")${reset}"; last="${tools[$i]}"
+    fi
+    local mark=""; [ "${actives[$i]}" = 1 ] && mark="  ${green}← active${reset}"
+    printf "  %2d) %-16s ${dim}%s${reset}%s\n" "$((i+1))" "${names[$i]}" "${labels[$i]}" "$mark"
+  done
+  echo
+}
+
+if [ "$list_only" = 1 ]; then show_menu; exit 0; fi
+
+# ── Work out which profiles to switch to ─────────────────────────────────────
+picked=()
+if [ "$reopen" = 1 ]; then
+  :  # keep every tool on its current account
+elif [ ${#direct[@]} -gt 0 ]; then
+  [ ${#direct[@]} -eq 2 ] || die "usage: aiswitch <claude|codex> <profile>"
+  found=""
+  for i in "${!tools[@]}"; do
+    [ "${tools[$i]}" = "${direct[0]}" ] && [ "${names[$i]}" = "${direct[1]}" ] && found=$i
+  done
+  [ -n "$found" ] || die "no ${direct[0]} profile called '${direct[1]}' (see: aiswitch --list)"
+  picked=("$found")
+else
+  show_menu
+  printf "Pick a number (or one per tool, e.g. \"1 3\"), Enter to cancel: "
+  read -r reply || exit 0
+  [ -n "$reply" ] || { echo "Nothing changed."; exit 0; }
+  seen_claude=0; seen_codex=0
+  for n in $reply; do
+    case "$n" in (*[!0-9]*|'') die "'$n' isn't a number from the list" ;; esac
+    i=$((n-1))
+    [ "$i" -ge 0 ] && [ "$i" -lt ${#tools[@]} ] || die "$n isn't in the list"
+    if [ "${tools[$i]}" = claude ]; then
+      [ $seen_claude = 0 ] || die "pick at most one Claude Code account"; seen_claude=1
+    else
+      [ $seen_codex = 0 ] || die "pick at most one Codex account"; seen_codex=1
+    fi
+    picked+=("$i")
+  done
+fi
+
+# ── Switch, collecting the environment each tool needs ───────────────────────
+errfile=$(mktemp)
+trap 'rm -f "$errfile"' EXIT
+apply() {  # apply <tool> <profile>: switch, and load the env it needs into this script
+  local out
+  out=$(aisw use "$1" "$2" --emit-env --non-interactive 2>"$errfile") || {
+    echo "${red}Couldn't switch $(tool_title "$1") to '$2':${reset}" >&2
+    cat "$errfile" >&2; exit 1; }
+  eval "$out"
+}
+
+final_claude=""; final_codex=""
+for i in ${picked[@]+"${picked[@]}"}; do
+  apply "${tools[$i]}" "${names[$i]}"
+  [ "${tools[$i]}" = claude ] && final_claude="${names[$i]}" || final_codex="${names[$i]}"
+done
+
+# A tool you didn't pick keeps its current account, but VS Code still needs
+# that tool's variable when it restarts, so load it as well.
+for i in "${!tools[@]}"; do
+  [ "${actives[$i]}" = 1 ] || continue
+  if [ "${tools[$i]}" = claude ] && [ -z "$final_claude" ]; then
+    apply claude "${names[$i]}"; final_claude="${names[$i]}"
+  elif [ "${tools[$i]}" = codex ] && [ -z "$final_codex" ]; then
+    apply codex "${names[$i]}"; final_codex="${names[$i]}"
+  fi
+done
+
+echo; echo "${green}Now active:${reset}"
+[ -n "$final_claude" ] && echo "  Claude Code → ${bold}${final_claude}${reset}"
+[ -n "$final_codex" ]  && echo "  Codex       → ${bold}${final_codex}${reset}"
+
+[ "$restart" = 1 ] || { echo; echo "VS Code left as is (--no-restart)."; exit 0; }
+
+# ── Restart VS Code so it picks up the new accounts ──────────────────────────
+find_code_cli() {
+  [ -n "${AISWITCH_CODE_CLI:-}" ] && { echo "$AISWITCH_CODE_CLI"; return; }
+  local app
+  for app in "/Applications/Visual Studio Code.app" "$HOME/Applications/Visual Studio Code.app" \
+             "$(mdfind "kMDItemCFBundleIdentifier == 'com.microsoft.VSCode'" 2>/dev/null | head -1)"; do
+    [ -n "$app" ] && [ -x "$app/Contents/Resources/app/bin/code" ] && {
+      echo "$app/Contents/Resources/app/bin/code"; return; }
+  done
+}
+vscode_running() {
+  [ "$(osascript -e 'application id "com.microsoft.VSCode" is running' 2>/dev/null)" = true ]
+}
+
+code_cli=$(find_code_cli)
+[ -n "$code_cli" ] || die "couldn't find Visual Studio Code.app — accounts are switched, but reopen VS Code from this terminal yourself"
+
+if vscode_running; then
+  echo
+  if [ "$assume_yes" = 1 ]; then ok=y; else
+    printf "VS Code must restart to use the new account. Quit and reopen it now? [Y/n] "
+    read -r ok || ok=n
+  fi
+  case "$ok" in [nN]*) echo "Left VS Code open — it keeps the old account until it restarts. Run aiswitch again when ready."; exit 0 ;; esac
+  osascript -e 'tell application id "com.microsoft.VSCode" to quit' >/dev/null 2>&1
+  printf "Waiting for VS Code to close (answer any unsaved-file prompts)"
+  for _ in $(seq 1 60); do
+    vscode_running || break
+    printf "."; sleep 1
+  done
+  echo
+  vscode_running && die "VS Code is still open. Close it, then run aiswitch again."
+fi
+
+if [ -z "$open_path" ] && [ "$PWD" != "$HOME" ]; then open_path="$PWD"; fi
+if [ -n "$open_path" ]; then
+  "$code_cli" "$open_path" >/dev/null 2>&1 &
+  echo "Opening VS Code in ${bold}${open_path/#$HOME/~}${reset}."
+else
+  "$code_cli" >/dev/null 2>&1 &
+  echo "Reopening VS Code with your previous windows."
+fi
+echo "${dim}Local windows only — windows connected over SSH keep the server's own login.${reset}"
