@@ -47,6 +47,11 @@ os.environ["PATH"] = ":".join([
     os.path.join(HOME, "anaconda3/bin"), os.path.join(HOME, "miniconda3/bin"),
     "/usr/bin", "/bin", "/usr/sbin", "/sbin", os.environ.get("PATH", ""),
 ])
+# Often the only Codex CLI is the one bundled with the VS Code ChatGPT extension; aisw needs it on PATH too.
+if not any(d and os.access(os.path.join(d, "codex"), os.X_OK) for d in os.environ["PATH"].split(":")):
+    _bundled = glob.glob(os.path.join(HOME, ".vscode", "extensions", "openai.chatgpt-*", "bin", "*", "codex"))
+    if _bundled:
+        os.environ["PATH"] += ":" + os.path.dirname(max(_bundled, key=os.path.getmtime))
 
 SELF = os.path.abspath(__file__)
 PLUGIN_NAME = os.path.basename(SELF).split(".")[0]
@@ -336,7 +341,7 @@ def fetch_claude(p, old):
     exp = (c.get("expiresAt") or 0) / 1000.0
     if exp and exp < now() + 60:
         return {"status": "expired", "plan": plan,
-                "error": "Login needs a refresh — open Claude Code once on this account"}
+                "error": "Login needs a refresh — Wake it up below opens Claude Code on it"}
     code, body, hdrs, err = http_get(CLAUDE_USAGE_URL, {
         "Authorization": "Bearer " + c["accessToken"],
         "anthropic-beta": "oauth-2025-04-20",
@@ -357,7 +362,7 @@ def fetch_claude(p, old):
         return {"status": "busy", "plan": plan, "retry_after": wait,
                 "error": "Anthropic asked us to slow down — showing the last numbers"}
     if code == 401:
-        return {"status": "expired", "plan": plan, "error": "Login expired — open Claude Code once on this account"}
+        return {"status": "expired", "plan": plan, "error": "Login expired — Wake it up below opens Claude Code to sign in again"}
     if code == 403:
         return {"status": "error", "plan": plan, "error": "This login can't read usage (setup-token logins can't)"}
     return {"status": "error", "plan": plan, "error": err or "Usage check failed (HTTP %s)" % code}
@@ -403,20 +408,11 @@ def parse_wham(d):
     return [w for w in wins if w], notes, codex_plan_name(d.get("plan_type"))
 
 
-def codex_bin():
-    """`codex` on PATH, else the newest one bundled with the VS Code ChatGPT extension."""
-    for d in os.environ["PATH"].split(":"):
-        if d and os.access(os.path.join(d, "codex"), os.X_OK):
-            return os.path.join(d, "codex")
-    bundled = glob.glob(os.path.join(HOME, ".vscode", "extensions", "openai.chatgpt-*", "bin", "*", "codex"))
-    return max(bundled, key=os.path.getmtime) if bundled else "codex"
-
-
 def codex_app_server(pdir, timeout=25):
     """Ask Codex itself (documented JSON-RPC). Codex handles its own token refresh."""
     env = dict(os.environ, CODEX_HOME=pdir)
     try:
-        proc = subprocess.Popen([codex_bin(), "-s", "read-only", "-a", "never", "app-server"],
+        proc = subprocess.Popen(["codex", "-s", "read-only", "-a", "never", "app-server"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 text=True, bufsize=1, env=env)
     except OSError:
@@ -563,7 +559,7 @@ def fetch_codex(p, old):
             return {"status": "ok", "plan": data["plan"] or plan, "windows": data["windows"],
                     "notes": data["notes"], "source": "Codex"}
         if state == "expired":
-            return {"status": "expired", "plan": plan, "error": "Login expired — run codex once on this account"}
+            return {"status": "expired", "plan": plan, "error": "Login expired — Wake it up below opens Codex to sign in again"}
     # 3) whatever the last Codex session on this account recorded
     s = codex_from_sessions(p["dir"])
     if s:
@@ -851,6 +847,13 @@ MOOD_TEXT = {"thriving": "😊 Thriving", "content": "🙂 Doing fine", "hungry"
              "rich": "🪙 Well fed — pay-as-you-go API key"}
 
 
+def mood_text(p, entry):
+    mood, _ = mood_of(entry)
+    if mood == "snooze" and (entry or {}).get("status") == "expired":
+        return "💤 Snoozing — open %s to wake it" % dict((t, n) for t, n, _ in TOOLS)[p["tool"]]
+    return MOOD_TEXT[mood]
+
+
 def draw_pet(species, mood, life, frame=0):
     """-> 16x17 grid of RGBA tuples (None = transparent)."""
     W, H = 16, 17
@@ -1020,10 +1023,9 @@ def build_menu(profs, cache, cfg, frame):
     if grids:
         emit(" | image=%s" % png(grids, 4, 6, ground=True))
         for p in actives:
-            mood, _ = mood_of(cache.get(key_of(p)))
             glyph = dict((t, g) for t, _, g in TOOLS)[p["tool"]]
             emit("%s %s  %s | size=12 bash=\"%s\" param1=noop terminal=false" % (
-                glyph, safe(p["name"]), MOOD_TEXT[mood], SELF))
+                glyph, safe(p["name"]), mood_text(p, cache.get(key_of(p))), SELF))
         emit("---")
 
     for tool, tname, glyph in TOOLS:
@@ -1053,7 +1055,6 @@ def account_rows(emit, p, e):
     status = e.get("status")
     plan = e.get("plan") or ""
     head = p["name"] + ("  ·  " + plan if plan else "")
-    mood, _ = mood_of(e)
     if status == "apikey":
         summary = "pay as you go"
     elif not e:
@@ -1078,7 +1079,7 @@ def account_rows(emit, p, e):
     emit("%s   —   %s | image=%s bash=\"%s\" param1=noop terminal=false%s" % (
         safe(head), safe(summary), pet_icon(pet_species(p["tool"]), e), SELF, active))
 
-    emit("--%s | size=13" % MOOD_TEXT[mood])
+    emit("--%s | size=13" % mood_text(p, e))
     if p["label"]:
         emit("--%s | size=11 color=%s disabled=true" % (safe(p["label"]), GREY))
     for x in e.get("windows") or []:
@@ -1101,6 +1102,9 @@ def account_rows(emit, p, e):
         emit("--Updated %s%s | size=11 color=%s disabled=true" % (
             fmt_age(e.get("as_of") or e.get("fetched_at")), " · from " + src if src else "", GREY))
     emit("-----")
+    if status == "expired":
+        emit("--Wake it up — opens %s on this account | bash=\"%s\" param1=wake param2=%s param3=\"%s\" terminal=false refresh=true sfimage=alarm" % (
+            dict((t, n) for t, n, _ in TOOLS)[p["tool"]], SELF, p["tool"], safe(p["name"])))
     if p["active"]:
         emit("--✓ This is the active account | disabled=true")
     else:
@@ -1272,23 +1276,61 @@ read -n1 -s -r -p "Press any key to close this window…"
 rm -f "$0"
 """ % {"path": os.environ["PATH"], "tname": tname, "name": name, "body": body, "plugin": PLUGIN_NAME,
        "py": sys.executable, "self": SELF, "tool": tool}
+    open_in_terminal("add-%s-%s.command" % (tool, name), script)
+
+
+def open_in_terminal(fname, script):
     os.makedirs(DATA_DIR, exist_ok=True)
-    path = os.path.join(DATA_DIR, "add-%s-%s.command" % (tool, name))
+    path = os.path.join(DATA_DIR, fname)
     with open(path, "w") as f:
         f.write(script)
     os.chmod(path, 0o700)
     run(["open", path], timeout=10)
 
 
+def do_wake(tool, name):
+    """Open Terminal running Claude Code / Codex on this account. It renews its own login as it
+    starts (or asks you to sign in); aipets itself still never touches the login or sends a prompt."""
+    pdir = os.path.join(AISW_HOME, "profiles", tool, name)
+    if not (re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name) and os.path.isdir(pdir)):
+        return
+    tname = dict((t, n) for t, n, _ in TOOLS)[tool]
+    script = """#!/bin/bash
+export PATH="%(path)s"
+export %(var)s="%(dir)s"
+trap ':' INT  # a Ctrl-C quits the tool, not this script
+clear
+echo "⏰  Waking up the %(tname)s account “%(name)s”"
+echo
+echo "%(tname)s renews its login as it starts. If it asks you to sign in, do that."
+echo "Then quit it (type %(quit)s) and the pet wakes up."
+echo
+%(tool)s
+echo
+echo "🐣  Checking on it…"
+"%(py)s" "%(self)s" fetch "%(tool)s:%(name)s" >/dev/null 2>&1
+open -g "swiftbar://refreshplugin?name=%(plugin)s"
+read -n1 -s -r -p "Done. Press any key to close this window…"
+rm -f "$0"
+""" % {"path": os.environ["PATH"], "var": "CLAUDE_CONFIG_DIR" if tool == "claude" else "CODEX_HOME", "dir": pdir,
+       "quit": "/exit" if tool == "claude" else "/quit", "tname": tname, "name": name, "tool": tool,
+       "py": sys.executable, "self": SELF, "plugin": PLUGIN_NAME}
+    open_in_terminal("wake-%s-%s.command" % (tool, name), script)
+
+
 def do_remove(tool, name):
     tname = dict((t, n) for t, n, _ in TOOLS)[tool]
     service = "Anthropic" if tool == "claude" else "OpenAI"
-    ok = dialog("Remove the %s account “%s”?\n\nThis deletes the login saved for it on this Mac (aisw keeps a backup "
-                "you can restore). Your %s account itself isn't affected." % (tname, name, service),
+    active = any(p["tool"] == tool and p["name"] == name and p["active"] for p in profiles() or [])
+    note = ("It's the active account, so %s will have no account selected until you add or switch to "
+            "another one.\n\n" % tname) if active else ""
+    ok = dialog("Remove the %s account “%s”?\n\n%sThis deletes the login saved for it on this Mac (aisw keeps a backup "
+                "you can restore). Your %s account itself isn't affected." % (tname, name, note, service),
                 ["Cancel", "Remove"], "Cancel", caution=True)
     if not ok or ok[0] != "Remove":
         return
-    rc, out, err = run(["aisw", "remove", tool, name, "--yes", "--non-interactive"], timeout=60)
+    cmd = ["aisw", "remove", tool, name, "--yes", "--non-interactive"] + (["--force"] if active else [])
+    rc, out, err = run(cmd, timeout=60)
     if rc == 0:
         cache = read_json(CACHE_FILE, {})
         cache.pop("%s:%s" % (tool, name), None)
@@ -1296,8 +1338,6 @@ def do_remove(tool, name):
         notify("👋 Said goodbye to %s" % name, "The %s account was removed from this Mac." % tname)
     else:
         msg = " ".join(l for l in strip_ansi(out + err).splitlines() if l.strip())
-        if "active" in msg.lower():
-            msg = "It's the active account — switch to another one first, then remove it."
         notify("Couldn't remove %s" % name, msg[-200:] or "unknown error")
     refresh_widget()
 
@@ -1317,6 +1357,8 @@ def main(argv):
         do_add(argv[2])
     elif cmd == "remove":
         do_remove(argv[2], argv[3])
+    elif cmd == "wake":
+        do_wake(argv[2], argv[3])
     elif cmd == "toggle":
         if len(argv) > 2 and argv[2] in ("alerts", "animate"):
             s = settings()
