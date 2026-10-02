@@ -403,11 +403,20 @@ def parse_wham(d):
     return [w for w in wins if w], notes, codex_plan_name(d.get("plan_type"))
 
 
+def codex_bin():
+    """`codex` on PATH, else the newest one bundled with the VS Code ChatGPT extension."""
+    for d in os.environ["PATH"].split(":"):
+        if d and os.access(os.path.join(d, "codex"), os.X_OK):
+            return os.path.join(d, "codex")
+    bundled = glob.glob(os.path.join(HOME, ".vscode", "extensions", "openai.chatgpt-*", "bin", "*", "codex"))
+    return max(bundled, key=os.path.getmtime) if bundled else "codex"
+
+
 def codex_app_server(pdir, timeout=25):
     """Ask Codex itself (documented JSON-RPC). Codex handles its own token refresh."""
     env = dict(os.environ, CODEX_HOME=pdir)
     try:
-        proc = subprocess.Popen(["codex", "-s", "read-only", "-a", "untrusted", "app-server"],
+        proc = subprocess.Popen([codex_bin(), "-s", "read-only", "-a", "never", "app-server"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 text=True, bufsize=1, env=env)
     except OSError:
@@ -637,8 +646,9 @@ def fetch(targets):
         k = key_of(p)
         entry = cache.get(k)
         forced = targets == "all" or k in targets
-        blocked = (entry or {}).get("blocked_until", 0) > t
-        if not (forced and not blocked) and not due(p, entry, t):
+        # a click skips our own error backoff, but not a service's "slow down"
+        held = (entry or {}).get("blocked_until", 0) > t and (entry or {}).get("status") == "busy"
+        if not (forced and not held) and not due(p, entry, t):
             continue
         new = (fetch_claude if p["tool"] == "claude" else fetch_codex)(p, entry)
         cache = read_json(CACHE_FILE, {})  # re-read: others may have written meanwhile
