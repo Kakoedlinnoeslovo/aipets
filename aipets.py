@@ -970,13 +970,6 @@ def pet_icon(species, entry):
     return _icon_cache[k]
 
 
-def hearts(life):
-    if life is None:
-        return "♡♡♡♡♡"
-    n = int((life + 19) // 20)
-    return "♥" * n + "♡" * (5 - n)
-
-
 # ── menu ─────────────────────────────────────────────────────────────────────
 TICK = 0.6  # seconds per animation frame
 
@@ -1017,10 +1010,10 @@ def build_menu(profs, cache, cfg, frame):
     if grids:
         emit(" | image=%s" % png(grids, 4, 6, ground=True))
         for p in actives:
-            mood, life = mood_of(cache.get(key_of(p)))
+            mood, _ = mood_of(cache.get(key_of(p)))
             glyph = dict((t, g) for t, _, g in TOOLS)[p["tool"]]
-            emit("%s %s  %s  %s | size=12 bash=\"%s\" param1=noop terminal=false" % (
-                glyph, safe(p["name"]), hearts(life), MOOD_TEXT[mood], SELF))
+            emit("%s %s  %s | size=12 bash=\"%s\" param1=noop terminal=false" % (
+                glyph, safe(p["name"]), MOOD_TEXT[mood], SELF))
         emit("---")
 
     for tool, tname, glyph in TOOLS:
@@ -1050,7 +1043,7 @@ def account_rows(emit, p, e):
     status = e.get("status")
     plan = e.get("plan") or ""
     head = p["name"] + ("  ·  " + plan if plan else "")
-    mood, life = mood_of(e)
+    mood, _ = mood_of(e)
     if status == "apikey":
         summary = "pay as you go"
     elif not e:
@@ -1075,7 +1068,7 @@ def account_rows(emit, p, e):
     emit("%s   —   %s | image=%s bash=\"%s\" param1=noop terminal=false%s" % (
         safe(head), safe(summary), pet_icon(pet_species(p["tool"]), e), SELF, active))
 
-    emit("--%s   %s | size=13" % (MOOD_TEXT[mood], hearts(life)))
+    emit("--%s | size=13" % MOOD_TEXT[mood])
     if p["label"]:
         emit("--%s | size=11 color=%s disabled=true" % (safe(p["label"]), GREY))
     for x in e.get("windows") or []:
