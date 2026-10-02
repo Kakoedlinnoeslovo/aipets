@@ -403,11 +403,20 @@ def parse_wham(d):
     return [w for w in wins if w], notes, codex_plan_name(d.get("plan_type"))
 
 
+def codex_bin():
+    """`codex` on PATH, else the newest one bundled with the VS Code ChatGPT extension."""
+    for d in os.environ["PATH"].split(":"):
+        if d and os.access(os.path.join(d, "codex"), os.X_OK):
+            return os.path.join(d, "codex")
+    bundled = glob.glob(os.path.join(HOME, ".vscode", "extensions", "openai.chatgpt-*", "bin", "*", "codex"))
+    return max(bundled, key=os.path.getmtime) if bundled else "codex"
+
+
 def codex_app_server(pdir, timeout=25):
     """Ask Codex itself (documented JSON-RPC). Codex handles its own token refresh."""
     env = dict(os.environ, CODEX_HOME=pdir)
     try:
-        proc = subprocess.Popen(["codex", "-s", "read-only", "-a", "untrusted", "app-server"],
+        proc = subprocess.Popen([codex_bin(), "-s", "read-only", "-a", "never", "app-server"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 text=True, bufsize=1, env=env)
     except OSError:
@@ -637,8 +646,9 @@ def fetch(targets):
         k = key_of(p)
         entry = cache.get(k)
         forced = targets == "all" or k in targets
-        blocked = (entry or {}).get("blocked_until", 0) > t
-        if not (forced and not blocked) and not due(p, entry, t):
+        # a click skips our own error backoff, but not a service's "slow down"
+        held = (entry or {}).get("blocked_until", 0) > t and (entry or {}).get("status") == "busy"
+        if not (forced and not held) and not due(p, entry, t):
             continue
         new = (fetch_claude if p["tool"] == "claude" else fetch_codex)(p, entry)
         cache = read_json(CACHE_FILE, {})  # re-read: others may have written meanwhile
@@ -970,13 +980,6 @@ def pet_icon(species, entry):
     return _icon_cache[k]
 
 
-def hearts(life):
-    if life is None:
-        return "♡♡♡♡♡"
-    n = int((life + 19) // 20)
-    return "♥" * n + "♡" * (5 - n)
-
-
 # ── menu ─────────────────────────────────────────────────────────────────────
 TICK = 0.6  # seconds per animation frame
 
@@ -1017,10 +1020,10 @@ def build_menu(profs, cache, cfg, frame):
     if grids:
         emit(" | image=%s" % png(grids, 4, 6, ground=True))
         for p in actives:
-            mood, life = mood_of(cache.get(key_of(p)))
+            mood, _ = mood_of(cache.get(key_of(p)))
             glyph = dict((t, g) for t, _, g in TOOLS)[p["tool"]]
-            emit("%s %s  %s  %s | size=12 bash=\"%s\" param1=noop terminal=false" % (
-                glyph, safe(p["name"]), hearts(life), MOOD_TEXT[mood], SELF))
+            emit("%s %s  %s | size=12 bash=\"%s\" param1=noop terminal=false" % (
+                glyph, safe(p["name"]), MOOD_TEXT[mood], SELF))
         emit("---")
 
     for tool, tname, glyph in TOOLS:
@@ -1050,7 +1053,7 @@ def account_rows(emit, p, e):
     status = e.get("status")
     plan = e.get("plan") or ""
     head = p["name"] + ("  ·  " + plan if plan else "")
-    mood, life = mood_of(e)
+    mood, _ = mood_of(e)
     if status == "apikey":
         summary = "pay as you go"
     elif not e:
@@ -1075,7 +1078,7 @@ def account_rows(emit, p, e):
     emit("%s   —   %s | image=%s bash=\"%s\" param1=noop terminal=false%s" % (
         safe(head), safe(summary), pet_icon(pet_species(p["tool"]), e), SELF, active))
 
-    emit("--%s   %s | size=13" % (MOOD_TEXT[mood], hearts(life)))
+    emit("--%s | size=13" % MOOD_TEXT[mood])
     if p["label"]:
         emit("--%s | size=11 color=%s disabled=true" % (safe(p["label"]), GREY))
     for x in e.get("windows") or []:

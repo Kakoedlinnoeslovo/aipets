@@ -39,7 +39,7 @@ def font(size, mono=False, bold=False):
 
 
 F_BAR, F_MENU, F_SMALL, F_MONO, F_BOLD, F_CAP = font(22), font(21), font(17), font(19, mono=True), font(21, bold=True), font(24, bold=True)
-SYM = font(21, mono=True)  # has ♥ ♡ ✳ ◎
+SYM = font(21, mono=True)  # has ✳ ◎
 F_ROW = font(19)
 
 
@@ -169,11 +169,10 @@ def draw(i):
         for x in range(0, hab.width, 8):
             hd.rectangle([x, hab.height - 4, x + 3, hab.height - 2], fill=(160, 150, 140, 200))
         img.alpha_composite(hab, (mx0 + 24, my0 + 14))
-        d.text((mx0 + 200, my0 + 22), "✳ personal  ♥♥♥♥♥  Thriving", font=F_MENU, fill=(30, 30, 30))
+        d.text((mx0 + 200, my0 + 22), "✳ personal  Thriving", font=F_MENU, fill=(30, 30, 30))
         mood_word = {"thriving": "Thriving", "content": "Doing fine", "hungry": "Getting hungry",
                      "exhausted": "Exhausted", "sleep": "Asleep"}[mood_for(cl)]
-        hearts = ap.hearts(cl)
-        d.text((mx0 + 200, my0 + 54), "◎ %s  %s  %s" % (s["codex_name"], hearts, mood_word), font=F_MENU, fill=(30, 30, 30))
+        d.text((mx0 + 200, my0 + 54), "◎ %s  %s" % (s["codex_name"], mood_word), font=F_MENU, fill=(30, 30, 30))
         y = my0 + 104
         d.line([mx0 + 14, y, mx1 - 14, y], fill=(215, 211, 205))
         y += 10
@@ -229,7 +228,7 @@ def draw(i):
             shadowed_panel(img, [sx0, sy0, sx0 + 504, sy0 + 200])
             d = ImageDraw.Draw(img)
             yy = sy0 + 16
-            d.text((sx0 + 20, yy), "%s   %s" % (mood_word, hearts), font=F_MENU, fill=(30, 30, 30))
+            d.text((sx0 + 20, yy), mood_word, font=F_MENU, fill=(30, 30, 30))
             yy += 38
             for lab, lf, rs in (("5h", cl, "in 48m"), ("Week", 73, "Mon 09:01")):
                 d.text((sx0 + 20, yy), lab, font=F_MONO, fill=life_color(lf))
