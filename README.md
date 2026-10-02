@@ -28,7 +28,7 @@ hit a limit by surprise again.
 | 10–29% | 😰 Hungry | sweat drop, red |
 | under 10% | 🥵 Exhausted | half-closed eyes |
 | limit hit | 😴 Asleep | floating Z until the reset |
-| login expired | 💤 Snoozing | "?" — open Claude Code / Codex once to wake it |
+| login expired | 💤 Snoozing | "?" — **Wake it up** in its menu opens Claude Code / Codex on it |
 | no data yet | 🥚 Egg | wobbles while the first check runs |
 | API key | 🪙 Well fed | gold, pay-as-you-go |
 
@@ -37,6 +37,8 @@ hit a limit by surprise again.
 - macOS with [SwiftBar](https://swiftbar.app) (`brew install --cask swiftbar`)
 - [aisw](https://github.com/burakdede/aisw) with your Claude Code / Codex accounts saved as profiles
 - Python 3.7+ (the one that ships with macOS's command line tools is fine — no packages needed)
+- For Codex accounts, the Codex CLI (`brew install --cask codex`); the copy bundled with VS Code's ChatGPT
+  extension is picked up too
 
 ## Install
 
@@ -63,7 +65,10 @@ Keychain — that's aipets reading your saved Claude login to ask for its quota.
 - **Switch to …** makes it the active account and restarts VS Code with it.
 - **＋ Add a … account** asks for sign-in method and a name, then opens Terminal for the login.
   API keys are typed there, never into the widget.
-- **Remove this account…** deletes the saved login from this Mac (aisw keeps a backup). Not allowed for the active account.
+- **Wake it up** shows on a snoozing pet. It opens Terminal running Claude Code / Codex on that account, which
+  renews its own login as it starts (or asks you to sign in). Quit it and the pet wakes up.
+- **Remove this account…** deletes the saved login from this Mac (aisw keeps a backup). Works on the active
+  account too: that tool then has no account selected until you add or switch to another one.
 - **Animation** can be turned off if you prefer still pets.
 
 `aiswitch` also works from the terminal:
@@ -102,7 +107,11 @@ update can break a row. Please open an issue with the "Updated …" line if that
   ```bash
   for d in ~/.aisw/profiles/claude/*; do h=$(printf '%s' "$d" | shasum -a 256 | cut -c1-8); security find-generic-password -s "Claude Code-credentials-$h" >/dev/null 2>&1 && echo "$d: found" || echo "$d: missing"; done
   ```
-- **"Login needs a refresh".** Open Claude Code or Codex once on that account; it refreshes its own login.
+- **"Login needs a refresh".** Claude Code only renews a login while it runs on that account, so one you haven't
+  used for a few hours dozes off. Click **Wake it up** in its menu, or do the same by hand and quit once it opens:
+  ```bash
+  CLAUDE_CONFIG_DIR="$HOME/.aisw/profiles/claude/<name>" claude   # Codex: CODEX_HOME=… codex
+  ```
 - **The menu flickers while open.** Turn **Animation** off at the bottom of the menu.
 - **Nothing happens on click.** Make sure `aiswitch` is in `~/.local/bin` and executable.
 
