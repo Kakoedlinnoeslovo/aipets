@@ -16,6 +16,10 @@ hit a limit by surprise again.
 - 🔀 **One-click switching** between accounts (via [aisw](https://github.com/burakdede/aisw)), with VS Code restarted
   so its Claude Code and Codex panels pick up the new login. A ✨ hint suggests the account with the most life.
 - ➕ **Add and remove accounts** from the menu: sign in with the browser or paste an API key.
+- 🩹 **Fix it** for logins that need you: one click renews the login (or signs you in again) and tells you
+  if you signed in with the wrong account.
+- 🖥️ **SSH windows follow too**, if you want: VS Code windows connected to a Mac over SSH can use the accounts
+  picked in that Mac's menu.
 
 ## Moods
 
@@ -28,7 +32,7 @@ hit a limit by surprise again.
 | 10–29% | 😰 Hungry | sweat drop, red |
 | under 10% | 🥵 Exhausted | half-closed eyes |
 | limit hit | 😴 Asleep | floating Z until the reset |
-| login expired | 💤 Snoozing | "?" — **Wake it up** in its menu opens Claude Code / Codex on it |
+| login expired / missing | 💤 Snoozing | "?" — click its line, or **Fix it** in its menu |
 | no data yet | 🥚 Egg | wobbles while the first check runs |
 | API key | 🪙 Well fed | gold, pay-as-you-go |
 
@@ -65,8 +69,13 @@ Keychain — that's aipets reading your saved Claude login to ask for its quota.
 - **Switch to …** makes it the active account and restarts VS Code with it.
 - **＋ Add a … account** asks for sign-in method and a name, then opens Terminal for the login.
   API keys are typed there, never into the widget.
-- **Wake it up** shows on a snoozing pet. It opens Terminal running Claude Code / Codex on that account, which
-  renews its own login as it starts (or asks you to sign in). Quit it and the pet wakes up.
+- **🩹 Fix it** shows on a snoozing pet (and **Fix all** at the top when several need you). It opens one Terminal
+  window that goes through each account: if Claude Code is still signed in there, it starts Claude Code, which
+  renews its own login, and closes it again by itself once the login is fresh. If the account is signed out
+  (or it's Codex), your browser opens to sign in. Afterwards it checks the account and warns you if you signed
+  in with a different account than before.
+- **VS Code SSH windows into this Mac** shows when a VS Code window is connected to this Mac over SSH. Turn it on
+  once and those windows use the accounts you pick here: see [SSH windows](#ssh-windows).
 - **Remove this account…** deletes the saved login from this Mac (aisw keeps a backup). Works on the active
   account too: that tool then has no account selected until you add or switch to another one.
 - **Animation** can be turned off if you prefer still pets.
@@ -82,7 +91,22 @@ aiswitch --reopen     # restart VS Code with the current accounts
 
 > **Why VS Code needs a restart:** aisw keeps each account in its own folder and points the tools at it with
 > `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. VS Code only reads those when it starts, so aipets relaunches it with the
-> right values. Windows connected over SSH keep the server's own login.
+> right values.
+
+### SSH windows
+
+A VS Code window connected to a Mac over SSH (**SSH: …** in the corner) runs its Codex and Claude Code panels
+on *that* Mac, inside a VS Code Server started by the SSH login. Restarting the VS Code app doesn't touch it, so
+by default those panels keep using that Mac's default login whatever you pick.
+
+To make them follow, use the aipets on the Mac you connect **to**: when a VS Code window is connected to it,
+its menu shows **VS Code SSH windows into this Mac ignore switches — fix…**. That adds three lines to
+`~/.zshenv` there, which load the active accounts for SSH logins only (local terminals don't change). From then
+on every switch on that Mac also restarts its VS Code Server, so SSH windows reconnect on the new account. If
+a window asks, click **Reload Window**. Click the item again (now ticked) to turn it off and remove the lines.
+
+aiswitch keeps the active accounts in `~/.local/state/aiswitch/env.sh` (just the two folder paths). It's
+updated when you switch through aipets or `aiswitch`, so after a bare `aisw use …` run `aiswitch --reopen` too.
 
 ## How it works
 
@@ -97,6 +121,7 @@ the numbers:
 **Read-only by design.** aipets never refreshes or rewrites a login (refresh tokens are single-use, so doing that
 would log Claude Code or Codex out), never sends prompts with your subscription, and never writes tokens to disk,
 logs or command lines. If a service says "slow down", it backs off and keeps showing the last numbers with their age.
+**Fix it** keeps to that: it hands the account to Claude Code or Codex, which renew their own login or sign you in.
 
 These usage endpoints are unofficial and change from time to time; aipets parses them defensively, but a service
 update can break a row. Please open an issue with the "Updated …" line if that happens.
@@ -108,10 +133,12 @@ update can break a row. Please open an issue with the "Updated …" line if that
   for d in ~/.aisw/profiles/claude/*; do h=$(printf '%s' "$d" | shasum -a 256 | cut -c1-8); security find-generic-password -s "Claude Code-credentials-$h" >/dev/null 2>&1 && echo "$d: found" || echo "$d: missing"; done
   ```
 - **"Login needs a refresh".** Claude Code only renews a login while it runs on that account, so one you haven't
-  used for a few hours dozes off. Click **Wake it up** in its menu, or do the same by hand and quit once it opens:
+  used for a few hours dozes off. Click **Fix it** in its menu, or do the same by hand and quit once it opens:
   ```bash
   CLAUDE_CONFIG_DIR="$HOME/.aisw/profiles/claude/<name>" claude   # Codex: CODEX_HOME=… codex
   ```
+- **An SSH window still shows the old account.** Switch with the aipets on the Mac the window connects to, and
+  turn on **VS Code SSH windows into this Mac** there (see [SSH windows](#ssh-windows)).
 - **The menu flickers while open.** Turn **Animation** off at the bottom of the menu.
 - **Nothing happens on click.** Make sure `aiswitch` is in `~/.local/bin` and executable.
 

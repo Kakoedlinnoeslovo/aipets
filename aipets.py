@@ -31,6 +31,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -235,23 +236,31 @@ def key_of(p):
 
 
 # ── Claude Code ──────────────────────────────────────────────────────────────
-def keychain_read(service):
-    rc, out, _ = run(["security", "find-generic-password", "-s", service, "-w"], timeout=8)
+KEYCHAIN_NOT_FOUND = 44  # what `security` exits with when the item doesn't exist
+KEYCHAIN_WAIT = 8  # seconds; longer when a person is at the Fix it window to answer a prompt
+
+
+def keychain_read(service, timeout=8):
+    """-> (value or None, readable). readable is False when the Keychain itself said no (locked,
+    access denied, prompt left unanswered) rather than the item simply not existing."""
+    rc, out, _ = run(["security", "find-generic-password", "-s", service, "-w"], timeout=timeout)
     if rc != 0:
-        return None
+        return None, rc == KEYCHAIN_NOT_FOUND
     out = out.strip()
     if out and not out.startswith("{") and re.fullmatch(r"[0-9a-fA-F]+", out):
         try:  # `security -w` prints hex when the stored value contains a newline
             out = bytes.fromhex(out).decode("utf-8", "replace").strip()
         except ValueError:
             pass
-    return out
+    return out, True
 
 
-def claude_credentials(pdir):
+def claude_credentials(pdir, timeout=8):
+    """-> (freshest saved login or None, keychain_blocked)."""
     h = hashlib.sha256(unicodedata.normalize("NFC", pdir).encode()).hexdigest()[:8]
     found = []
-    raws = [keychain_read("Claude Code-credentials-" + h)]
+    raw, readable = keychain_read("Claude Code-credentials-" + h, timeout)
+    raws = [raw]
     try:
         with open(os.path.join(pdir, ".credentials.json")) as f:
             raws.append(f.read())
@@ -264,7 +273,8 @@ def claude_credentials(pdir):
             continue
         if o.get("accessToken"):
             found.append(o)
-    return max(found, key=lambda o: o.get("expiresAt") or 0) if found else None
+    best = max(found, key=lambda o: o.get("expiresAt") or 0) if found else None
+    return best, not readable
 
 
 def claude_plan(c):
@@ -334,14 +344,17 @@ def parse_claude_usage(d):
 def fetch_claude(p, old):
     if p["api_key"]:
         return {"status": "apikey", "plan": "API key"}
-    c = claude_credentials(p["dir"])
+    c, blocked = claude_credentials(p["dir"], KEYCHAIN_WAIT)
     if not c:
-        return {"status": "nologin", "error": "No saved login found for this profile"}
+        if blocked:
+            return {"status": "nologin", "error": "Couldn't read this login from the Keychain (locked, or access "
+                                                  "was denied) — Fix it below asks again"}
+        return {"status": "nologin", "error": "No saved login found for this profile — Fix it below signs you in"}
     plan = claude_plan(c)
     exp = (c.get("expiresAt") or 0) / 1000.0
     if exp and exp < now() + 60:
         return {"status": "expired", "plan": plan,
-                "error": "Login needs a refresh — Wake it up below opens Claude Code on it"}
+                "error": "Login needs a refresh — Fix it below renews it in Claude Code"}
     code, body, hdrs, err = http_get(CLAUDE_USAGE_URL, {
         "Authorization": "Bearer " + c["accessToken"],
         "anthropic-beta": "oauth-2025-04-20",
@@ -362,7 +375,7 @@ def fetch_claude(p, old):
         return {"status": "busy", "plan": plan, "retry_after": wait,
                 "error": "Anthropic asked us to slow down — showing the last numbers"}
     if code == 401:
-        return {"status": "expired", "plan": plan, "error": "Login expired — Wake it up below opens Claude Code to sign in again"}
+        return {"status": "expired", "plan": plan, "error": "Login expired — Fix it below renews it in Claude Code"}
     if code == 403:
         return {"status": "error", "plan": plan, "error": "This login can't read usage (setup-token logins can't)"}
     return {"status": "error", "plan": plan, "error": err or "Usage check failed (HTTP %s)" % code}
@@ -559,14 +572,14 @@ def fetch_codex(p, old):
             return {"status": "ok", "plan": data["plan"] or plan, "windows": data["windows"],
                     "notes": data["notes"], "source": "Codex"}
         if state == "expired":
-            return {"status": "expired", "plan": plan, "error": "Login expired — Wake it up below opens Codex to sign in again"}
+            return {"status": "expired", "plan": plan, "error": "Login expired — Fix it below signs you in to Codex again"}
     # 3) whatever the last Codex session on this account recorded
     s = codex_from_sessions(p["dir"])
     if s:
         return {"status": "ok", "plan": s["plan"] or plan, "windows": s["windows"], "source": "last session",
                 "as_of": s["as_of"]}
     if not token:
-        return {"status": "nologin", "plan": plan, "error": "No saved login found for this profile"}
+        return {"status": "nologin", "plan": plan, "error": "No saved login found for this profile — Fix it below signs you in"}
     return {"status": "error", "plan": plan, "error": "Couldn't read usage right now"}
 
 
@@ -846,12 +859,18 @@ MOOD_TEXT = {"thriving": "😊 Thriving", "content": "🙂 Doing fine", "hungry"
              "snooze": "💤 Snoozing — needs you to log in again", "egg": "🥚 Hatching… (checking quota)",
              "rich": "🪙 Well fed — pay-as-you-go API key"}
 
+FIXABLE = ("expired", "nologin")  # statuses the "Fix it" action knows how to repair
+
 
 def mood_text(p, entry):
     mood, _ = mood_of(entry)
     if mood == "snooze" and (entry or {}).get("status") == "expired":
-        return "💤 Snoozing — open %s to wake it" % dict((t, n) for t, n, _ in TOOLS)[p["tool"]]
+        return "💤 Snoozing — its login needs a refresh"
     return MOOD_TEXT[mood]
+
+
+def needs_fix(entry):
+    return (entry or {}).get("status") in FIXABLE
 
 
 def draw_pet(species, mood, life, frame=0):
@@ -1019,13 +1038,28 @@ def build_menu(profs, cache, cfg, frame):
         emit("AI pets | sfimage=pawprint")
     emit("---")
 
-    # the habitat: big pets, then one status line each
+    # the habitat: big pets, then one status line each (a snoozing pet's line fixes it)
     if grids:
         emit(" | image=%s" % png(grids, 4, 6, ground=True))
         for p in actives:
             glyph = dict((t, g) for t, _, g in TOOLS)[p["tool"]]
-            emit("%s %s  %s | size=12 bash=\"%s\" param1=noop terminal=false" % (
-                glyph, safe(p["name"]), mood_text(p, cache.get(key_of(p))), SELF))
+            e = cache.get(key_of(p))
+            if needs_fix(e):
+                emit("%s %s  %s  ·  click to fix | size=12 %s" % (
+                    glyph, safe(p["name"]), mood_text(p, e), fix_action(p["tool"], p["name"])))
+            else:
+                emit("%s %s  %s | size=12 bash=\"%s\" param1=noop terminal=false" % (
+                    glyph, safe(p["name"]), mood_text(p, e), SELF))
+    # one click for every login that needs you (skipped when the only one is already clickable above)
+    broken = [p for p in profs if needs_fix(cache.get(key_of(p)))]
+    glyphs = dict((t, g) for t, _, g in TOOLS)
+    if len(broken) > 1:
+        emit("🩹 Fix all %d logins that need you  (%s) | size=13 %s" % (
+            len(broken), ", ".join("%s %s" % (glyphs[p["tool"]], safe(p["name"])) for p in broken), fix_action("all")))
+    elif broken and not broken[0]["active"]:
+        emit("🩹 Fix the %s %s login | size=13 %s" % (
+            glyphs[broken[0]["tool"]], safe(broken[0]["name"]), fix_action(broken[0]["tool"], broken[0]["name"])))
+    if grids or broken:
         emit("---")
 
     for tool, tname, glyph in TOOLS:
@@ -1040,6 +1074,12 @@ def build_menu(profs, cache, cfg, frame):
 
     vs = "Restart" if vscode_running() else "Open"
     emit("%s VS Code with the active accounts | bash=\"%s\" param1=reopen terminal=false refresh=true sfimage=arrow.clockwise" % (vs, SELF))
+    ssh = cfg.get("_ssh") or {}
+    if ssh.get("follows"):
+        emit("VS Code SSH windows into this Mac follow switches | bash=\"%s\" param1=ssh-follow param2=off terminal=false refresh=true checked=true" % SELF)
+    elif ssh.get("servers"):
+        emit("VS Code SSH windows into this Mac ignore switches — fix… | bash=\"%s\" param1=ssh-follow param2=on terminal=false refresh=true sfimage=exclamationmark.triangle color=%s" % (
+            SELF, AMBER.split(",")[0]))
     emit("Check on everyone now | bash=\"%s\" param1=fetch-now param2=all terminal=false refresh=true sfimage=arrow.triangle.2.circlepath" % SELF)
     emit("Alerts %s — at %d%% life and when a pet falls asleep | bash=\"%s\" param1=toggle param2=alerts terminal=false refresh=true sfimage=%s" % (
         "on" if cfg.get("alerts") else "off", 100 - ALERT_AT, SELF, "bell.badge.fill" if cfg.get("alerts") else "bell.slash"))
@@ -1102,9 +1142,9 @@ def account_rows(emit, p, e):
         emit("--Updated %s%s | size=11 color=%s disabled=true" % (
             fmt_age(e.get("as_of") or e.get("fetched_at")), " · from " + src if src else "", GREY))
     emit("-----")
-    if status == "expired":
-        emit("--Wake it up — opens %s on this account | bash=\"%s\" param1=wake param2=%s param3=\"%s\" terminal=false refresh=true sfimage=alarm" % (
-            dict((t, n) for t, n, _ in TOOLS)[p["tool"]], SELF, p["tool"], safe(p["name"])))
+    if status in FIXABLE:
+        how = "renews the login in Claude Code" if (p["tool"], status) == ("claude", "expired") else "signs you in again"
+        emit("--🩹 Fix it — %s | %s" % (how, fix_action(p["tool"], p["name"])))
     if p["active"]:
         emit("--✓ This is the active account | disabled=true")
     else:
@@ -1114,6 +1154,12 @@ def account_rows(emit, p, e):
         safe(p["name"]), SELF, key_of(p)))
     emit("--Remove this account… | bash=\"%s\" param1=remove param2=%s param3=\"%s\" terminal=false refresh=true sfimage=trash color=%s" % (
         SELF, p["tool"], safe(p["name"]), RED.split(",")[0]))
+
+
+def fix_action(tool, name=""):
+    """SwiftBar params for a click that runs `aipets fix` on one account, or on every one that needs it."""
+    return "bash=\"%s\" param1=fix param2=%s%s terminal=false refresh=true" % (
+        SELF, tool, " param3=\"%s\"" % safe(name) if name else "")
 
 
 def suggest(emit, mine, cache):
@@ -1147,7 +1193,9 @@ def render_once():
     cache = read_json(CACHE_FILE, {})
     if profs and any(due(p, cache.get(key_of(p)), now()) for p in profs):
         spawn_fetch("due")
-    print(build_menu(profs, cache, settings(), int(now() / TICK)))
+    cfg = settings()
+    cfg["_ssh"] = ssh_state()
+    print(build_menu(profs, cache, cfg, int(now() / TICK)))
 
 
 def stream():
@@ -1162,6 +1210,7 @@ def stream():
             mt = None
         if t - loaded_at > 30 or mt != mtime:
             profs, cache, cfg, loaded_at, mtime = profiles(), read_json(CACHE_FILE, {}), settings(), t, mt
+            cfg["_ssh"] = ssh_state()
             if profs and any(due(p, cache.get(key_of(p)), t) for p in profs):
                 spawn_fetch("due")
         try:
@@ -1217,13 +1266,110 @@ def do_switch(tool, name):
     title = dict((t, n) for t, n, _ in TOOLS).get(tool, tool)
     os.chdir(HOME)
     running = vscode_running()
-    rc, out, err = run([aiswitch_bin(), tool, name, "--yes" if running else "--no-restart"], timeout=120)
+    servers = ssh_follows() and vscode_servers_running()
+    rc, out, err = run([aiswitch_bin(), tool, name, "--yes", "--keep-closed"], timeout=150)
     if rc == 0:
-        notify("%s → %s" % (title, name), "Restarting VS Code with this account." if running
-               else "Start VS Code with “Open VS Code with the active accounts” in this menu.")
+        if running and servers:
+            msg = "Restarting VS Code with this account. SSH windows into this Mac reconnect too."
+        elif running:
+            msg = "Restarting VS Code with this account."
+        elif servers:
+            msg = "SSH windows into this Mac reconnect with this account (click Reload Window if asked)."
+        else:
+            msg = "Start VS Code with “Open VS Code with the active accounts” in this menu."
+        notify("%s → %s" % (title, name), msg)
     else:
         lines = [l for l in strip_ansi(out + err).splitlines() if l.strip()]
         notify("Couldn't switch %s" % title, " ".join(lines[-2:]) or "unknown error")
+
+
+# ── VS Code SSH windows into this Mac ────────────────────────────────────────
+# Their Codex / Claude Code panels run in a VS Code Server here, started by the SSH login, so they never
+# see the accounts aiswitch gives the VS Code app. aiswitch writes the accounts to
+# ~/.local/state/aiswitch/env.sh on every
+# switch; this include makes SSH logins load it, and aiswitch then restarts the server on each switch.
+ZSHENV = os.path.join(HOME, ".zshenv")
+SSH_MARK = "# >>> aipets: SSH windows follow switches >>>"
+SSH_END = "# <<< aipets <<<"
+SSH_BLOCK = """%s
+# VS Code windows connected to this Mac over SSH use the accounts picked in aipets (local shells don't change).
+if [ -n "$SSH_CONNECTION" ] && [ -r "$HOME/.local/state/aiswitch/env.sh" ]; then . "$HOME/.local/state/aiswitch/env.sh"; fi
+%s
+""" % (SSH_MARK, SSH_END)
+
+
+def ssh_follows():
+    try:
+        with open(ZSHENV) as f:
+            return SSH_MARK in f.read()
+    except OSError:
+        return False
+
+
+def vscode_servers_running():
+    rc, _, _ = run(["pgrep", "-f", os.path.join(HOME, r"\.vscode-server/")], timeout=5)
+    return rc == 0
+
+
+def ssh_state():
+    return {"follows": ssh_follows(), "servers": vscode_servers_running()}
+
+
+def login_shell():
+    try:
+        import pwd
+        return os.path.basename(pwd.getpwuid(os.getuid()).pw_shell or "")
+    except (ImportError, KeyError):
+        return os.path.basename(os.environ.get("SHELL", ""))
+
+
+def do_ssh_follow(turn_on):
+    if turn_on:
+        shell = login_shell()
+        if shell != "zsh":
+            dialog("Your login shell here is %s, so aipets can't set this up by itself.\n\nAdd these lines to the file "
+                   "your shell reads for SSH logins:\n\n%s" % (shell or "unknown", SSH_BLOCK.strip()), ["OK"], "OK")
+            return
+        ok = dialog("Make VS Code windows that connect to this Mac over SSH use the accounts you pick here?\n\n"
+                    "aipets adds 3 lines to ~/.zshenv that load the active accounts for SSH logins only — terminals "
+                    "on this Mac don't change.\n\nFrom then on, each switch also restarts the VS Code Server on this "
+                    "Mac, so SSH windows reconnect on the new account (their terminals start fresh, like local "
+                    "windows when VS Code restarts).", ["Cancel", "Turn on"], "Turn on")
+        if not ok or ok[0] != "Turn on":
+            return
+        try:
+            existing = open(ZSHENV).read() if os.path.exists(ZSHENV) else ""
+            with open(ZSHENV, "a") as f:
+                f.write(("\n" if existing and not existing.endswith("\n") else "") + SSH_BLOCK)
+        except OSError as e:
+            notify("Couldn't edit ~/.zshenv", str(e))
+            return
+        os.chdir(HOME)
+        run([aiswitch_bin(), "--reopen", "--no-restart"], timeout=60)  # writes the accounts file now
+        again = dialog("Done. SSH windows that are open right now still use their old login until they reconnect.\n\n"
+                       "Reconnect them now?", ["Later", "Reconnect now"], "Reconnect now")
+        if again and again[0] == "Reconnect now":
+            run([aiswitch_bin(), "--reopen", "--ssh-only", "--yes"], timeout=60)
+            notify("SSH windows follow switches", "They're reconnecting now — click Reload Window if one asks.")
+        else:
+            notify("SSH windows follow switches", "They pick up the active accounts the next time they reconnect.")
+    else:
+        ok = dialog("Stop VS Code SSH windows into this Mac from following your switches?\n\naipets removes its "
+                    "lines from ~/.zshenv. SSH windows go back to this Mac's default login when they next reconnect.",
+                    ["Cancel", "Turn off"], "Cancel")
+        if not ok or ok[0] != "Turn off":
+            return
+        try:
+            text = open(ZSHENV).read()
+            start, end = text.index(SSH_MARK), text.index(SSH_END) + len(SSH_END)
+            text = text[:start].rstrip("\n") + ("\n" if text[:start].strip() else "") + text[end:].lstrip("\n")
+            with open(ZSHENV, "w") as f:
+                f.write(text)
+        except (OSError, ValueError) as e:
+            notify("Couldn't edit ~/.zshenv", str(e))
+            return
+        notify("SSH windows keep their own login", "Removed aipets' lines from ~/.zshenv.")
+    refresh_widget()
 
 
 def do_reopen():
@@ -1288,34 +1434,171 @@ def open_in_terminal(fname, script):
     run(["open", path], timeout=10)
 
 
-def do_wake(tool, name):
-    """Open Terminal running Claude Code / Codex on this account. It renews its own login as it
-    starts (or asks you to sign in); aipets itself still never touches the login or sends a prompt."""
-    pdir = os.path.join(AISW_HOME, "profiles", tool, name)
-    if not (re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name) and os.path.isdir(pdir)):
-        return
-    tname = dict((t, n) for t, n, _ in TOOLS)[tool]
-    script = """#!/bin/bash
-export PATH="%(path)s"
-export %(var)s="%(dir)s"
-trap ':' INT  # a Ctrl-C quits the tool, not this script
+# ── Fix it ───────────────────────────────────────────────────────────────────
+# aipets still never refreshes a login itself: it hands the account to Claude Code / Codex, which renew
+# their own login (or sign you in), then checks the result.
+def profile_dir(tool, name):
+    return os.path.join(AISW_HOME, "profiles", tool, name)
+
+
+def valid_profile(tool, name):
+    return (tool in dict((t, n) for t, n, _ in TOOLS) and bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name or ""))
+            and os.path.isdir(profile_dir(tool, name)))
+
+
+def account_email(tool, name, after_login=False):
+    """Who a saved login belongs to ('' if unknown). For Claude, before a fix prefer aisw's record of who
+    the account was added as; after one, what Claude Code says it's now signed in as."""
+    pdir = profile_dir(tool, name)
+    if tool == "codex":
+        tokens = read_json(os.path.join(pdir, "auth.json"), {}).get("tokens") or {}
+        return jwt_claims(tokens.get("id_token") or "").get("email") or ""
+    added = read_json(os.path.join(pdir, "oauth-account.json"), {}).get("emailAddress") or ""
+    current = (read_json(os.path.join(pdir, ".claude.json"), {}).get("oauthAccount") or {}).get("emailAddress") or ""
+    return (current or added) if after_login else (added or current)
+
+
+def login_ok(tool, name):
+    """A saved login aipets can read, not expired. Local only, no network."""
+    pdir = profile_dir(tool, name)
+    if tool == "claude":
+        c, _ = claude_credentials(pdir, timeout=60)  # a Keychain prompt may be waiting for a click
+        return bool(c) and (c.get("expiresAt") or 0) / 1000.0 > now() + 60
+    tok = (read_json(os.path.join(pdir, "auth.json"), {}).get("tokens") or {}).get("access_token")
+    return bool(tok) and (jwt_claims(tok).get("exp") or 0) > now() + 60
+
+
+def recheck(tool, name):
+    """Check one account right now (no backoff) and save the result. -> its status."""
+    p = next((x for x in profiles() or [] if x["tool"] == tool and x["name"] == name), None)
+    if not p:
+        return "missing"
+    k = key_of(p)
+    new = (fetch_claude if tool == "claude" else fetch_codex)(p, read_json(CACHE_FILE, {}).get(k))
+    cache = read_json(CACHE_FILE, {})
+    cache[k] = merge(cache.get(k), new, now())
+    write_json(CACHE_FILE, cache)
+    refresh_widget()
+    return new.get("status") or "error"
+
+
+def close_when_fresh(tool, name, parent):
+    """Runs beside the tool in the Fix it window: once the login is fresh, quit the tool so nobody has to."""
+    import signal
+    mine = {os.getpid(), os.getppid()}
+    deadline = now() + 15 * 60
+    while now() < deadline:
+        time.sleep(2)
+        if login_ok(tool, name):
+            time.sleep(2)  # let it finish writing its own files
+            _, out, _ = run(["pgrep", "-P", str(parent)], timeout=5)
+            for pid in out.split():
+                if pid.isdigit() and int(pid) not in mine:
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                    except OSError:
+                        pass
+            time.sleep(1)  # after the tool has restored the screen
+            print("\n✅  Login renewed, so this window closed %s for you." % dict((t, n) for t, n, _ in TOOLS)[tool],
+                  flush=True)
+            return
+
+
+FIX_SCRIPT = r"""#!/bin/bash
+export PATH=%(path)s
+PY=%(py)s
+SELF=%(self)s
+trap ':' INT  # a Ctrl-C quits Claude Code / Codex, not this window
+fixed=0
+
+fine() { case "$1" in ok|busy|apikey) return 0 ;; *) return 1 ;; esac; }
+
+claude_signed_in() {  # does Claude Code itself think this profile is signed in?
+  CLAUDE_CONFIG_DIR="$1" claude auth status --json 2>/dev/null |
+    "$PY" -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("loggedIn") else 1)' 2>/dev/null
+}
+
+result() {  # tool name dir expected-email
+  local st now
+  st=$("$PY" "$SELF" recheck "$1" "$2")
+  now=$("$PY" "$SELF" whoami "$1" "$2")
+  if [ -n "$4" ] && [ -n "$now" ] && [ "$now" != "$4" ]; then
+    echo "⚠️   You're now signed in as $now, but “$2” was $4."
+    echo "     If that's wrong, click Fix it again and choose $4 in the browser."
+  fi
+  if fine "$st"; then
+    echo "🐣  “$2” is awake again."; fixed=$((fixed + 1))
+  elif [ "$1" = claude ] && [ "$st" = nologin ] && claude_signed_in "$3"; then
+    echo "🤔  Claude Code says it's signed in, but aipets still can't read the login from your Keychain."
+    echo "     Run Fix it again and click “Always Allow” if macOS asks."
+  else
+    echo "❌  Still not working ($st). Hover the account in the menu for details."
+  fi
+}
+
+fix_claude() {  # name dir expected-email
+  echo; echo "━━━  ✳ Claude Code · $1  ━━━"
+  if fine "$("$PY" "$SELF" recheck claude "$1")"; then echo "✅  Already fine, nothing to do."; fixed=$((fixed + 1)); return; fi
+  if claude_signed_in "$2"; then
+    echo "Still signed in, so starting Claude Code renews the login. This window closes it by"
+    echo "itself once that's done. If it asks you to log in instead, type /login${3:+ and use $3}."
+    echo
+    "$PY" "$SELF" close-when-fresh claude "$1" $$ &
+    local watcher=$!
+    CLAUDE_CONFIG_DIR="$2" claude
+    kill "$watcher" 2>/dev/null
+    stty sane 2>/dev/null
+    echo
+  else
+    echo "Signed out. Your browser opens to sign in${3:+ — use $3}."
+    echo
+    CLAUDE_CONFIG_DIR="$2" claude auth login
+  fi
+  result claude "$1" "$2" "$3"
+}
+
+fix_codex() {  # name dir expected-email
+  echo; echo "━━━  ◎ Codex · $1  ━━━"
+  if fine "$("$PY" "$SELF" recheck codex "$1")"; then echo "✅  Already fine, nothing to do."; fixed=$((fixed + 1)); return; fi
+  echo "Your browser opens to sign in${3:+ — use $3}."
+  echo
+  CODEX_HOME="$2" codex login
+  result codex "$1" "$2" "$3"
+}
+
 clear
-echo "⏰  Waking up the %(tname)s account “%(name)s”"
+echo "🩹  Fixing %(what)s"
+%(steps)s
 echo
-echo "%(tname)s renews its login as it starts. If it asks you to sign in, do that."
-echo "Then quit it (type %(quit)s) and the pet wakes up."
-echo
-%(tool)s
-echo
-echo "🐣  Checking on it…"
-"%(py)s" "%(self)s" fetch "%(tool)s:%(name)s" >/dev/null 2>&1
+echo "Fixed $fixed of %(count)d."
 open -g "swiftbar://refreshplugin?name=%(plugin)s"
-read -n1 -s -r -p "Done. Press any key to close this window…"
+echo
+read -n1 -s -r -p "Press any key to close this window…"
 rm -f "$0"
-""" % {"path": os.environ["PATH"], "var": "CLAUDE_CONFIG_DIR" if tool == "claude" else "CODEX_HOME", "dir": pdir,
-       "quit": "/exit" if tool == "claude" else "/quit", "tname": tname, "name": name, "tool": tool,
-       "py": sys.executable, "self": SELF, "plugin": PLUGIN_NAME}
-    open_in_terminal("wake-%s-%s.command" % (tool, name), script)
+"""
+
+
+def do_fix(tool, name=""):
+    """Open one Terminal window that walks through each login that needs you."""
+    if tool == "all":
+        cache = read_json(CACHE_FILE, {})
+        targets = [(p["tool"], p["name"]) for p in profiles() or [] if needs_fix(cache.get(key_of(p)))]
+    else:
+        targets = [(tool, name)]
+    targets = [(t, n) for t, n in targets if valid_profile(t, n)]
+    if not targets:
+        notify("Nothing to fix", "Every login looks fine right now.")
+        return
+    q = shlex.quote
+    steps = "\n".join("fix_%s %s %s %s" % (t, q(n), q(profile_dir(t, n)), q(account_email(t, n))) for t, n in targets)
+    tnames = dict((t, n) for t, n, _ in TOOLS)
+    what = ("the %s login “%s”" % (tnames[targets[0][0]], targets[0][1]) if len(targets) == 1
+            else "%d logins" % len(targets))
+    script = FIX_SCRIPT % {"path": q(os.environ["PATH"]), "py": q(sys.executable), "self": q(SELF),
+                           "what": what.replace('"', ""), "steps": steps, "count": len(targets),
+                           "plugin": urllib.parse.quote(PLUGIN_NAME)}
+    fname = "fix-%s.command" % ("all" if len(targets) > 1 else "%s-%s" % targets[0])
+    open_in_terminal(fname, script)
 
 
 def do_remove(tool, name):
@@ -1343,6 +1626,7 @@ def do_remove(tool, name):
 
 
 def main(argv):
+    global KEYCHAIN_WAIT
     cmd = argv[1] if len(argv) > 1 else ""
     if cmd == "fetch":
         target = argv[2] if len(argv) > 2 else "due"
@@ -1357,8 +1641,23 @@ def main(argv):
         do_add(argv[2])
     elif cmd == "remove":
         do_remove(argv[2], argv[3])
-    elif cmd == "wake":
-        do_wake(argv[2], argv[3])
+    elif cmd in ("fix", "wake"):  # "wake" was the old name, kept for menus still open from before
+        do_fix(argv[2], argv[3] if len(argv) > 3 else "")
+    elif cmd in ("recheck", "login-ok", "whoami", "close-when-fresh"):  # helpers for the Fix it window
+        KEYCHAIN_WAIT = 60
+        tool, name = argv[2], argv[3]
+        if not valid_profile(tool, name):
+            sys.exit(2)
+        if cmd == "recheck":
+            print(recheck(tool, name))
+        elif cmd == "login-ok":
+            sys.exit(0 if login_ok(tool, name) else 1)
+        elif cmd == "whoami":
+            print(account_email(tool, name, after_login=True))
+        else:
+            close_when_fresh(tool, name, int(argv[4]))
+    elif cmd == "ssh-follow":
+        do_ssh_follow(len(argv) > 2 and argv[2] == "on")
     elif cmd == "toggle":
         if len(argv) > 2 and argv[2] in ("alerts", "animate"):
             s = settings()
