@@ -10,23 +10,36 @@
 #   --no-restart   switch accounts but leave VS Code alone
 #   --reopen       don't switch; just restart VS Code with the current accounts
 #   --yes          restart VS Code without asking first
+#   --keep-closed  restart VS Code only if it's already open; never launch it
+#   --ssh-only     restart only the VS Code Server behind SSH windows into this Mac
 #   --open PATH    folder to open in VS Code (default: current folder,
 #                  or just your previous windows when run from ~)
+#
+# SSH windows: a VS Code window connected to this Mac over SSH runs its Codex and
+# Claude Code panels in a VS Code Server here, which never sees the accounts picked
+# for the app. Every switch writes them to ~/.local/state/aiswitch/env.sh; with the
+# include aipets can add to ~/.zshenv, SSH logins load that file, and aiswitch
+# restarts the VS Code Server so those windows reconnect on the new accounts.
 
 set -o pipefail
 
 bold=$'\033[1m'; dim=$'\033[2m'; green=$'\033[32m'; red=$'\033[31m'; reset=$'\033[0m'
 die() { echo "${red}aiswitch: $*${reset}" >&2; exit 1; }
 
-list_only=0; restart=1; reopen=0; assume_yes=0; open_path=""; direct=()
+ENV_FILE="${AISWITCH_ENV_FILE:-$HOME/.local/state/aiswitch/env.sh}"
+SSH_MARK="# >>> aipets: SSH windows follow switches >>>"
+
+list_only=0; restart=1; reopen=0; assume_yes=0; keep_closed=0; ssh_only=0; open_path=""; direct=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --list|-l)      list_only=1 ;;
     --no-restart)   restart=0 ;;
     --reopen)       reopen=1 ;;
     --yes|-y)       assume_yes=1 ;;
+    --keep-closed)  keep_closed=1 ;;
+    --ssh-only)     ssh_only=1 ;;
     --open)         shift; open_path="${1:-}" ;;
-    -h|--help)      sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)             die "unknown option $1 (try --help)" ;;
     *)              direct+=("$1") ;;
   esac
@@ -136,6 +149,33 @@ echo; echo "${green}Now active:${reset}"
 [ -n "$final_claude" ] && echo "  Claude Code → ${bold}${final_claude}${reset}"
 [ -n "$final_codex" ]  && echo "  Codex       → ${bold}${final_codex}${reset}"
 
+# ── Record the accounts for SSH logins (the VS Code Server behind SSH windows) ─
+write_env_file() {  # only the tools aisw manages here; anything else is left alone
+  local tmp line v val
+  mkdir -p "$(dirname "$ENV_FILE")" || return 1
+  tmp="$ENV_FILE.tmp.$$"
+  {
+    echo "# Written by aiswitch on every switch. Loaded by SSH logins via ~/.zshenv (see aipets)."
+    for line in "CLAUDE_CONFIG_DIR $final_claude" "CODEX_HOME $final_codex"; do
+      set -- $line
+      v="$1"
+      [ -n "${2:-}" ] || continue
+      case "$v" in CLAUDE_CONFIG_DIR) val="${CLAUDE_CONFIG_DIR:-}" ;; *) val="${CODEX_HOME:-}" ;; esac
+      if [ -n "$val" ]; then printf 'export %s=%q\n' "$v" "$val"; else printf 'unset %s\n' "$v"; fi
+    done
+  } > "$tmp" && mv "$tmp" "$ENV_FILE"
+}
+(umask 077; write_env_file) || echo "${dim}(couldn't write $ENV_FILE)${reset}"
+
+ssh_follows() { grep -qF "$SSH_MARK" "$HOME/.zshenv" 2>/dev/null; }
+vscode_servers_running() { pgrep -f "$HOME/\.vscode-server/" >/dev/null 2>&1; }
+restart_vscode_servers() {
+  trap '' HUP  # if this runs in an SSH window's terminal, finish anyway
+  pkill -TERM -f "$HOME/\.vscode-server/" 2>/dev/null
+  for _ in 1 2 3 4 5; do vscode_servers_running || return 0; sleep 1; done
+  pkill -KILL -f "$HOME/\.vscode-server/" 2>/dev/null
+}
+
 [ "$restart" = 1 ] || { echo; echo "VS Code left as is (--no-restart)."; exit 0; }
 
 # ── Restart VS Code so it picks up the new accounts ──────────────────────────
@@ -152,16 +192,51 @@ vscode_running() {
   [ "$(osascript -e 'application id "com.microsoft.VSCode" is running' 2>/dev/null)" = true ]
 }
 
-code_cli=$(find_code_cli)
-[ -n "$code_cli" ] || die "couldn't find Visual Studio Code.app — accounts are switched, but reopen VS Code from this terminal yourself"
-
-if vscode_running; then
-  echo
-  if [ "$assume_yes" = 1 ]; then ok=y; else
-    printf "VS Code must restart to use the new account. Quit and reopen it now? [Y/n] "
-    read -r ok || ok=n
+ssh_note() {
+  if ssh_follows; then
+    echo "${dim}VS Code windows connected to this Mac over SSH follow these accounts too.${reset}"
+  else
+    echo "${dim}Windows connected over SSH keep that machine's own login (aipets can make SSH windows into this Mac follow).${reset}"
   fi
-  case "$ok" in [nN]*) echo "Left VS Code open — it keeps the old account until it restarts. Run aiswitch again when ready."; exit 0 ;; esac
+}
+
+servers=0; ssh_follows && vscode_servers_running && servers=1
+app_open=0; vscode_running && app_open=1
+do_app=1
+[ "$ssh_only" = 1 ] && do_app=0
+[ "$keep_closed" = 1 ] && [ "$app_open" = 0 ] && do_app=0
+
+if [ "$do_app" = 0 ] && [ "$servers" = 0 ]; then
+  echo
+  if [ "$ssh_only" = 1 ]; then echo "No SSH windows into this Mac to reconnect."
+  else echo "VS Code isn't open — it will use these accounts when you open it from aipets."; fi
+  exit 0
+fi
+
+if [ "$do_app" = 1 ]; then
+  code_cli=$(find_code_cli)
+  [ -n "$code_cli" ] || die "couldn't find Visual Studio Code.app — accounts are switched, but reopen VS Code from this terminal yourself"
+fi
+
+if [ "$assume_yes" != 1 ] && { { [ "$do_app" = 1 ] && [ "$app_open" = 1 ]; } || [ "$servers" = 1 ]; }; then
+  echo
+  if [ "$do_app" = 1 ] && [ "$app_open" = 1 ]; then what="VS Code must restart to use the new account"; else what="SSH windows into this Mac must reconnect to use the new account"; fi
+  [ "$do_app" = 1 ] && [ "$app_open" = 1 ] && [ "$servers" = 1 ] && what="$what (SSH windows into this Mac reconnect too)"
+  printf "%s. Do it now? [Y/n] " "$what"
+  read -r ok || ok=n
+  case "$ok" in [nN]*) echo "Left VS Code as is — it keeps the old account until it restarts or reconnects. Run aiswitch again when ready."; exit 0 ;; esac
+fi
+
+if [ "$servers" = 1 ]; then
+  echo
+  restart_vscode_servers
+  echo "Restarted the VS Code Server here, so SSH windows into this Mac reconnect with these accounts."
+  echo "${dim}If one of them asks, click Reload Window.${reset}"
+fi
+
+[ "$do_app" = 1 ] || exit 0
+
+if [ "$app_open" = 1 ]; then
   osascript -e 'tell application id "com.microsoft.VSCode" to quit' >/dev/null 2>&1
   printf "Waiting for VS Code to close (answer any unsaved-file prompts)"
   for _ in $(seq 1 60); do
@@ -180,4 +255,4 @@ else
   "$code_cli" >/dev/null 2>&1 &
   echo "Reopening VS Code with your previous windows."
 fi
-echo "${dim}Local windows only — windows connected over SSH keep the server's own login.${reset}"
+ssh_note
